@@ -1,7 +1,6 @@
 import gradio as gr
 from earthquake_monitor import earthquake_monitor
 from video_classifier import video_classifier
-from camera_monitor import camera_monitor
 import os
 import pandas as pd
 import datetime
@@ -96,81 +95,6 @@ def classify_video_gradio(video_file_path_or_obj):
         return result
     except Exception as e:
         return f"Video işlenirken hata oluştu: {e}"
-
-# --- Camera Monitoring Functions (OPTIMIZED) ---
-
-def get_camera_choices():
-    """Get available camera choices from API"""
-    try:
-        streams = camera_monitor.get_all_camera_streams()
-        return [name for name, _ in streams] if streams else []
-    except Exception as e:
-        logger.error(f"Error getting cameras: {e}")
-        return []
-
-def load_camera_streams():
-    """Load camera streams and generate display"""
-    try:
-        stats = camera_monitor.get_recording_stats()
-        if not stats.get('success'):
-            return pd.DataFrame({"Durum": ["FastAPI sunucusu yanıt vermiyor"]}), "Sunucu bağlantısı yok"
-        
-        streams = camera_monitor.get_all_camera_streams()
-        if not streams:
-            return pd.DataFrame({"Durum": ["Kamera bulunamadı"]}), "Kamera yok"
-        
-        display_df = pd.DataFrame({"Kamera Adı": [name for name, _ in streams]})
-        html_grid = camera_monitor.get_camera_grid_html(max_cameras=12)
-        
-        return display_df, html_grid
-    except Exception as e:
-        return pd.DataFrame({"Hata": [str(e)]}), f"<p>Hata: {e}</p>"
-
-def analyze_camera_stream(camera_name, duration_minutes):
-    """Analyze camera recording - optimized version"""
-    if not camera_name:
-        return "Lütfen bir kamera seçin.", "", ""
-    
-    try:
-        duration_minutes = max(1, min(10, int(duration_minutes)))
-        
-        logger.info(f"Requesting {duration_minutes}min recording for {camera_name}")
-        video_path = camera_monitor.record_clip(camera_name, duration=duration_minutes)
-        
-        if not video_path or not os.path.exists(video_path):
-            segments_info = camera_monitor.get_camera_segments_info(camera_name)
-            if segments_info:
-                return f"Kayıt alınamadı. Mevcut: {segments_info.get('segments_available', 0)} segment", "", ""
-            return f"Kayıt alınamadı: {camera_name}", "", ""
-        
-        # Analyze video
-        file_size_mb = round(os.path.getsize(video_path) / (1024 * 1024), 2)
-        analysis_result = video_classifier.classify_video(video_path)
-        
-        result_msg = f"""
-**✅ Analiz Tamamlandı**
-- **Kamera:** {camera_name}
-- **Süre:** {duration_minutes} dakika
-- **Boyut:** {file_size_mb} MB
-- **Sonuç:** {analysis_result}
-- **Tarih:** {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-        """
-        
-        download_html = f"""
-        <div style="margin-top: 15px;">
-            <button onclick="window.open('http://localhost:8000/camera/{camera_name}/download/{duration_minutes}', '_blank')" 
-                    style="padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer;">
-                📥 Videoyu İndir ({duration_minutes} dakika)
-            </button>
-        </div>
-        """
-        
-        return result_msg, video_path, download_html
-        
-    except Exception as e:
-        logger.error(f"Analysis error: {e}")
-        return f"Analiz hatası: {e}", "", ""
-
 # --- Gradio Interface Definition ---
 
 with gr.Blocks(
@@ -211,149 +135,134 @@ with gr.Blocks(
         )
         
     with gr.Tab("Video Deprem Analizi"):
-        gr.Markdown("## Video ile Deprem Tespiti")
-        gr.Markdown("""
-        Bu bölümde, bir video yükleyerek videoda deprem belirtileri olup olmadığını analiz edebilirsiniz.
-        AI modeli, videoda sallanan binalar, yıkılmış alanlar gibi belirtiler arayacaktır.
-        **En iyi sonuçlar için MP4 formatında, 10-30 saniyelik videolar önerilir.**
-        """)
-        
+        gr.Markdown("## 🎥 Canlı Kamera Kısa Tespiti – SmolVLM-500M")
+        gr.Markdown(
+            "**Kullanım:** Aşağıdan bir mekan seçin, 10 saniyelik canlı kesit alınıp "
+            "deprem belirtisi var mı diye incelenecektir."
+        )
+
+        CAMERA_STREAMS = {
+            "kapali_carsi": "https://livestream.ibb.gov.tr/cam_turistik/b_kapalicarsi.stream/playlist.m3u8",
+            "metrohan": "https://livestream.ibb.gov.tr/cam_turistik/b_metrohan.stream/playlist.m3u8",
+            "sarachane": "https://livestream.ibb.gov.tr/cam_turistik/b_sarachane.stream/playlist.m3u8",
+            "sultanahmet_1": "https://livestream.ibb.gov.tr/cam_turistik/b_sultanahmet.stream/playlist.m3u8",
+            "taksim": "https://livestream.ibb.gov.tr/cam_turistik/b_taksim_meydan.stream/playlist.m3u8",
+        }
+
         with gr.Row():
             with gr.Column():
-                video_input = gr.Video(label="Videoyu Yükleyin")
-                classify_btn = gr.Button("Analiz Et", variant="primary")
-            
-            with gr.Column():
-                result_text = gr.Textbox(label="Analiz Sonucu", interactive=False, lines=5)
+                location = gr.Dropdown(
+                    label="Mekan seçin",
+                    choices=list(CAMERA_STREAMS.keys()),
+                    value="taksim",
+                )
+                run_btn = gr.Button("▶️ 10 sn çek ve analiz et", variant="primary")
 
-        classify_btn.click(
-            fn=classify_video_gradio,
-            inputs=video_input,
-            outputs=result_text
+            with gr.Column():
+                result_tb = gr.Textbox(
+                    label="🧠 Model cevabı",
+                    interactive=False,
+                    lines=4,
+                )
+        
+        with gr.Row():
+            captured_video = gr.Video(
+                label="📹 Yakalanan 10 saniyelik video",
+                interactive=False,
+                visible=False
+            )
+
+        def analyse_live(location_key: str) -> tuple[str, str]:
+            """Grab 10-s fragment to tmp file → classify → return result and video path."""
+            if not video_classifier.is_loaded:
+                return "Model yüklenmemiş, lütfen sunucu yöneticisine başvurun.", None
+
+            m3u8 = CAMERA_STREAMS.get(location_key)
+            if not m3u8:
+                return "Geçersiz mekan seçildi.", None
+
+            import tempfile, subprocess, os
+            import shutil
+
+            # Location display names (using ASCII-safe characters)
+            location_names = {
+                "kapali_carsi": "KAPALI CARSI",
+                "metrohan": "METROHAN", 
+                "sarachane": "SARACHANE",
+                "sultanahmet_1": "SULTANAHMET",
+                "taksim": "TAKSIM MEYDANI"
+            }
+
+            tmp_path = None
+            permanent_path = None
+            try:
+                # Create temporary file with .mp4 extension
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                    tmp_path = tmp.name
+
+                # Get current datetime for overlay (using dots instead of colons)
+                current_time = datetime.datetime.now().strftime("%d.%m.%Y %H.%M")
+                location_display = location_names.get(location_key, location_key.upper())
+                
+                # Create text overlay with proper escaping - avoid colons in text
+                line1 = location_display
+                line2 = current_time
+                line3 = "HIZIR AI - DEPREM ANALIZI"
+                
+                # Run FFmpeg with text overlay using multiple drawtext filters
+                cmd = [
+                    "ffmpeg",
+                    "-v", "error",          # only print real errors
+                    "-i", m3u8,
+                    "-t", "10",             # capture 10 seconds
+                    "-vf", f"drawtext=text='{line1}':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.8:boxborderw=5:x=10:y=10,drawtext=text='{line2}':fontcolor=white:fontsize=20:box=1:boxcolor=black@0.8:boxborderw=5:x=10:y=40,drawtext=text='{line3}':fontcolor=white:fontsize=18:box=1:boxcolor=black@0.8:boxborderw=5:x=10:y=70",
+                    "-c:a", "copy",         # copy audio without re-encoding
+                    "-y",                   # overwrite output file if exists
+                    tmp_path
+                ]
+                
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+                if proc.returncode != 0:
+                    stderr_text = proc.stderr if proc.stderr else "Unknown FFmpeg error"
+                    return f"FFmpeg hatası:\n{stderr_text}", None
+
+                # Verify the file was created and has content
+                if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                    return "Video dosyası oluşturulamadı veya boş.", None
+
+                # Copy to recordings directory with timestamp for permanent storage
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                recordings_dir = "recordings"
+                os.makedirs(recordings_dir, exist_ok=True)
+                permanent_path = os.path.join(recordings_dir, f"{location_key}_analysis_{timestamp}.mp4")
+                shutil.copy2(tmp_path, permanent_path)
+
+                # Classify the video
+                answer = video_classifier.classify_video(tmp_path)
+                return answer, permanent_path
+
+            except Exception as exc:
+                return f"Hata oluştu: {exc}", None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        def handle_analysis(location_key: str):
+            """Handle the analysis and return results for UI update."""
+            result, video_path = analyse_live(location_key)
+            if video_path:
+                return result, gr.Video(value=video_path, visible=True)
+            else:
+                return result, gr.Video(visible=False)
+
+        run_btn.click(
+            fn=handle_analysis, 
+            inputs=location, 
+            outputs=[result_tb, captured_video]
         )
     
-    with gr.Tab("📹 Canlı Kamera İzleme (FastAPI)"):
-        gr.Markdown("## İstanbul Canlı Kamera Kayıtları ve Deprem Analizi")
-        gr.Markdown("""
-        İstanbul'daki farklı noktalardan FastAPI sunucusu tarafından kaydedilen 
-        video dosyalarını analiz edebilirsiniz. **FastAPI sunucusu otomatik olarak başlatılmıştır.**
-        """)
         
-        # System status section
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("### ℹ️ Sunucu Bilgileri")
-                gr.HTML("""
-                <div style="padding: 15px; background: #e3f2fd; border-radius: 8px; margin: 10px 0;">
-                    <p><strong>FastAPI Sunucusu:</strong> localhost:8000</p>
-                    <p><strong>Durum:</strong> Otomatik başlatıldı</p>
-                    <p><strong>Segment Süresi:</strong> 10 saniye</p>
-                    <p><strong>Maksimum Kayıt:</strong> 10 dakika</p>
-                </div>
-                """)
-                
-            with gr.Column(scale=1):
-                gr.Markdown("### 📊 Sistem Durumu")
-                health_btn = gr.Button("🛠️ Sistem Kontrolü")
-                health_output = gr.JSON(label="Sistem İstatistikleri")
-
-        health_btn.click(
-            fn=camera_monitor.get_recording_stats,
-            inputs=None,
-            outputs=health_output
-        )
-        
-        # Main camera grid
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("### 📍 Mevcut Kameralar")
-                camera_list_df = gr.DataFrame(
-                    label="FastAPI Sunucusu Kameraları",
-                    interactive=False,
-                    wrap=True,
-                )
-                
-            with gr.Column(scale=2):
-                gr.Markdown("### 🎥 Kayıt Durumları")
-                camera_preview_html = gr.HTML(
-                    label="Kamera Kayıt Durumları",
-                    elem_classes=["camera-grid"]
-                )
-        
-        gr.Markdown("---")
-        gr.Markdown("### 🔍 Deprem Analizi için Kamera Seçin")
-        gr.Markdown("**Not:** Analiz, FastAPI sunucusundaki en son kayıttan yapılacaktır.")
-        
-        with gr.Row():
-            with gr.Column():
-                refresh_cameras_btn = gr.Button("🔄 Kamera Listesini Yenile", variant="secondary")
-                camera_selector = gr.Dropdown(
-                    label="Kamera Seçin",
-                    choices=get_camera_choices(),
-                    value=None,
-                    interactive=True
-                )
-                
-                selected_camera_preview = gr.HTML(label="Seçili Kamera Bilgileri")
-                
-                with gr.Row():
-                    duration_selector = gr.Dropdown(
-                        label="Kayıt Süresi (dakika)",
-                        choices=[1, 2, 5, 10],
-                        value=2,
-                        interactive=True
-                    )
-                    analyze_btn = gr.Button("🎯 Seçili Sürede Analiz Et", variant="primary")
-                
-            with gr.Column():
-                analysis_result = gr.Textbox(
-                    label="Analiz Sonucu",
-                    lines=8,
-                    interactive=False
-                )
-                recorded_video = gr.Video(
-                    label="Analiz Edilen Video",
-                    interactive=False
-                )
-                download_options = gr.HTML(
-                    label="İndirme Seçenekleri",
-                    value=""
-                )
-        
-        # Event handlers
-        def load_cameras_on_startup():
-            try:
-                df, html = load_camera_streams()
-                return df, html
-            except Exception as e:
-                return pd.DataFrame({"Hata": [str(e)]}), f"<p>Hata: {str(e)}</p>"
-
-        demo.load(
-            fn=load_cameras_on_startup,
-            inputs=None,
-            outputs=[camera_list_df, camera_preview_html]
-        )
-        
-        def refresh_camera_choices():
-            return gr.Dropdown(choices=get_camera_choices())
-
-        refresh_cameras_btn.click(
-            fn=refresh_camera_choices,
-            inputs=None,
-            outputs=camera_selector
-        )
-        
-        camera_selector.change(
-            fn=camera_monitor.get_simple_camera_preview,
-            inputs=camera_selector,
-            outputs=selected_camera_preview
-        )
-        
-        analyze_btn.click(
-            fn=analyze_camera_stream,
-            inputs=[camera_selector, duration_selector],
-            outputs=[analysis_result, recorded_video, download_options]
-        )
+       
 
 # --- Launch the App ---
 if __name__ == "__main__":
