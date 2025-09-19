@@ -1,5 +1,9 @@
 /.env
 /__pycache__
 /.vscode
+*/recordings
 /recordings
-
+*/ts_segments
+/ts_segments
+.gitignore
+*/.venv

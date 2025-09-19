@@ -1,10 +1,16 @@
 import gradio as gr
 from earthquake_monitor import earthquake_monitor
 from video_classifier import video_classifier
-from camera_monitor import camera_monitor  # Add this import
+from camera_monitor import camera_monitor
 import os
 import pandas as pd
 import datetime
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # --- Load Models at Startup ---
 print("Loading AI model...")
 try:
@@ -91,74 +97,79 @@ def classify_video_gradio(video_file_path_or_obj):
     except Exception as e:
         return f"Video işlenirken hata oluştu: {e}"
 
-# --- Camera Monitoring Functions ---
+# --- Camera Monitoring Functions (OPTIMIZED) ---
 
-def load_camera_streams():
-    """Load available camera streams - now instant!"""
+def get_camera_choices():
+    """Get available camera choices from API"""
     try:
         streams = camera_monitor.get_all_camera_streams()
+        return [name for name, _ in streams] if streams else []
+    except Exception as e:
+        logger.error(f"Error getting cameras: {e}")
+        return []
+
+def load_camera_streams():
+    """Load camera streams and generate display"""
+    try:
+        stats = camera_monitor.get_recording_stats()
+        if not stats.get('success'):
+            return pd.DataFrame({"Durum": ["FastAPI sunucusu yanıt vermiyor"]}), "Sunucu bağlantısı yok"
+        
+        streams = camera_monitor.get_all_camera_streams()
         if not streams:
-            return pd.DataFrame({"Durum": ["Kamera bulunamadı"]}), "Kameralar yüklenemedi."
+            return pd.DataFrame({"Durum": ["Kamera bulunamadı"]}), "Kamera yok"
         
-        # Create DataFrame for display
-        df = pd.DataFrame(streams, columns=["Kamera Adı", "Stream URL"])
-        # Only show camera names in the table for cleaner display
         display_df = pd.DataFrame({"Kamera Adı": [name for name, _ in streams]})
-        
-        # Generate HTML grid with video players
-        html_grid = camera_monitor.get_camera_grid_html(max_cameras=6)
+        html_grid = camera_monitor.get_camera_grid_html(max_cameras=12)
         
         return display_df, html_grid
     except Exception as e:
-        return pd.DataFrame({"Hata": [str(e)]}), f"<p>Hata: {str(e)}</p>"
+        return pd.DataFrame({"Hata": [str(e)]}), f"<p>Hata: {e}</p>"
 
-def preview_single_camera(camera_name):
-    """Show preview for a single selected camera"""
+def analyze_camera_stream(camera_name, duration_minutes):
+    """Analyze camera recording - optimized version"""
     if not camera_name:
-        return "<p>Lütfen bir kamera seçin</p>"
-    
-    return camera_monitor.get_simple_camera_preview(camera_name)
-
-def analyze_camera_stream(camera_name, duration):
-    """Record and analyze a clip from selected camera"""
-    if not camera_name:
-        return "Lütfen bir kamera seçin.", ""
+        return "Lütfen bir kamera seçin.", "", ""
     
     try:
-        # Get stream URL for selected camera
-        m3u8_url = camera_monitor.get_camera_url(camera_name)
+        duration_minutes = max(1, min(10, int(duration_minutes)))
         
-        if not m3u8_url:
-            return f"Kamera bulunamadı: {camera_name}", ""
+        logger.info(f"Requesting {duration_minutes}min recording for {camera_name}")
+        video_path = camera_monitor.record_clip(camera_name, duration=duration_minutes)
         
-        # Record clip with specified duration
-        status_msg = f"{camera_name} kamerasından {duration} saniyelik kayıt alınıyor..."
-        print(status_msg)
+        if not video_path or not os.path.exists(video_path):
+            segments_info = camera_monitor.get_camera_segments_info(camera_name)
+            if segments_info:
+                return f"Kayıt alınamadı. Mevcut: {segments_info.get('segments_available', 0)} segment", "", ""
+            return f"Kayıt alınamadı: {camera_name}", "", ""
         
-        video_path = camera_monitor.record_clip(camera_name, m3u8_url, duration=duration)
-        
-        if not video_path:
-            return f"Kayıt alınamadı: {camera_name}", ""
-        
-        # Analyze the recorded clip
-        print(f"Analyzing video: {video_path}")
+        # Analyze video
+        file_size_mb = round(os.path.getsize(video_path) / (1024 * 1024), 2)
         analysis_result = video_classifier.classify_video(video_path)
         
-        # Create result message
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         result_msg = f"""
-**Analiz Tamamlandı**
+**✅ Analiz Tamamlandı**
 - **Kamera:** {camera_name}
-- **Tarih/Saat:** {timestamp}
-- **Kayıt Süresi:** {duration} saniye
-- **Deprem Belirtisi:** {analysis_result}
-- **Dosya:** {os.path.basename(video_path)}
+- **Süre:** {duration_minutes} dakika
+- **Boyut:** {file_size_mb} MB
+- **Sonuç:** {analysis_result}
+- **Tarih:** {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         """
         
-        return result_msg, video_path
+        download_html = f"""
+        <div style="margin-top: 15px;">
+            <button onclick="window.open('http://localhost:8000/camera/{camera_name}/download/{duration_minutes}', '_blank')" 
+                    style="padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer;">
+                📥 Videoyu İndir ({duration_minutes} dakika)
+            </button>
+        </div>
+        """
+        
+        return result_msg, video_path, download_html
         
     except Exception as e:
-        return f"Analiz hatası: {str(e)}", ""
+        logger.error(f"Analysis error: {e}")
+        return f"Analiz hatası: {e}", "", ""
 
 # --- Gradio Interface Definition ---
 
@@ -221,57 +232,78 @@ with gr.Blocks(
             outputs=result_text
         )
     
-    with gr.Tab("📹 Canlı Kamera İzleme"):
-        gr.Markdown("## İstanbul Canlı Kamera Yayınları ve Deprem Analizi")
+    with gr.Tab("📹 Canlı Kamera İzleme (FastAPI)"):
+        gr.Markdown("## İstanbul Canlı Kamera Kayıtları ve Deprem Analizi")
         gr.Markdown("""
-        İstanbul'daki 25 farklı noktadan canlı kamera yayınlarını izleyebilir ve 
-        seçtiğiniz kameradan kayıt alarak deprem analizi yapabilirsiniz.
+        İstanbul'daki farklı noktalardan FastAPI sunucusu tarafından kaydedilen 
+        video dosyalarını analiz edebilirsiniz. **FastAPI sunucusu otomatik olarak başlatılmıştır.**
         """)
+        
+        # System status section
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### ℹ️ Sunucu Bilgileri")
+                gr.HTML("""
+                <div style="padding: 15px; background: #e3f2fd; border-radius: 8px; margin: 10px 0;">
+                    <p><strong>FastAPI Sunucusu:</strong> localhost:8000</p>
+                    <p><strong>Durum:</strong> Otomatik başlatıldı</p>
+                    <p><strong>Segment Süresi:</strong> 10 saniye</p>
+                    <p><strong>Maksimum Kayıt:</strong> 10 dakika</p>
+                </div>
+                """)
+                
+            with gr.Column(scale=1):
+                gr.Markdown("### 📊 Sistem Durumu")
+                health_btn = gr.Button("🛠️ Sistem Kontrolü")
+                health_output = gr.JSON(label="Sistem İstatistikleri")
+
+        health_btn.click(
+            fn=camera_monitor.get_recording_stats,
+            inputs=None,
+            outputs=health_output
+        )
         
         # Main camera grid
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### 📍 Kamera Listesi")
+                gr.Markdown("### 📍 Mevcut Kameralar")
                 camera_list_df = gr.DataFrame(
-                    label="Mevcut Kameralar",
+                    label="FastAPI Sunucusu Kameraları",
                     interactive=False,
                     wrap=True,
                 )
                 
             with gr.Column(scale=2):
-                gr.Markdown("### 🎥 Canlı Yayınlar")
+                gr.Markdown("### 🎥 Kayıt Durumları")
                 camera_preview_html = gr.HTML(
-                    label="Kamera Önizlemeleri",
+                    label="Kamera Kayıt Durumları",
                     elem_classes=["camera-grid"]
                 )
         
         gr.Markdown("---")
         gr.Markdown("### 🔍 Deprem Analizi için Kamera Seçin")
+        gr.Markdown("**Not:** Analiz, FastAPI sunucusundaki en son kayıttan yapılacaktır.")
         
         with gr.Row():
             with gr.Column():
+                refresh_cameras_btn = gr.Button("🔄 Kamera Listesini Yenile", variant="secondary")
                 camera_selector = gr.Dropdown(
                     label="Kamera Seçin",
-                    choices=[name for name, _ in camera_monitor.get_all_camera_streams()],
+                    choices=get_camera_choices(),
                     value=None,
                     interactive=True
                 )
                 
-                # Preview selected camera
-                selected_camera_preview = gr.HTML(
-                    label="Seçili Kamera Önizlemesi"
-                )
+                selected_camera_preview = gr.HTML(label="Seçili Kamera Bilgileri")
                 
                 with gr.Row():
-                    duration_slider = gr.Slider(
-                        minimum=10,
-                        maximum=60,
-                        value=30,
-                        step=5,
-                        label="Kayıt Süresi (saniye)",
+                    duration_selector = gr.Dropdown(
+                        label="Kayıt Süresi (dakika)",
+                        choices=[1, 2, 5, 10],
+                        value=2,
                         interactive=True
                     )
-                    analyze_btn = gr.Button("🎯 Kaydet ve Analiz Et", variant="primary")
+                    analyze_btn = gr.Button("🎯 Seçili Sürede Analiz Et", variant="primary")
                 
             with gr.Column():
                 analysis_result = gr.Textbox(
@@ -280,29 +312,47 @@ with gr.Blocks(
                     interactive=False
                 )
                 recorded_video = gr.Video(
-                    label="Kaydedilen Video",
+                    label="Analiz Edilen Video",
                     interactive=False
                 )
+                download_options = gr.HTML(
+                    label="İndirme Seçenekleri",
+                    value=""
+                )
         
-        # Load cameras on page load
+        # Event handlers
+        def load_cameras_on_startup():
+            try:
+                df, html = load_camera_streams()
+                return df, html
+            except Exception as e:
+                return pd.DataFrame({"Hata": [str(e)]}), f"<p>Hata: {str(e)}</p>"
+
         demo.load(
-            fn=load_camera_streams,
+            fn=load_cameras_on_startup,
             inputs=None,
             outputs=[camera_list_df, camera_preview_html]
         )
         
-        # Update preview when camera is selected
+        def refresh_camera_choices():
+            return gr.Dropdown(choices=get_camera_choices())
+
+        refresh_cameras_btn.click(
+            fn=refresh_camera_choices,
+            inputs=None,
+            outputs=camera_selector
+        )
+        
         camera_selector.change(
-            fn=preview_single_camera,
+            fn=camera_monitor.get_simple_camera_preview,
             inputs=camera_selector,
             outputs=selected_camera_preview
         )
         
-        # Analyze camera action
         analyze_btn.click(
             fn=analyze_camera_stream,
-            inputs=[camera_selector, duration_slider],
-            outputs=[analysis_result, recorded_video]
+            inputs=[camera_selector, duration_selector],
+            outputs=[analysis_result, recorded_video, download_options]
         )
 
 # --- Launch the App ---
